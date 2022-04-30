@@ -1,4 +1,5 @@
 """Utils package."""
+import os
 
 from tianshou.utils.config import tqdm_config
 from tianshou.utils.logger.base import BaseLogger, LazyLogger
@@ -19,4 +20,12 @@ __all__ = [
     "WandbLogger",
     "deprecation",
     "MultipleLRSchedulers",
+    "use_morl",
 ]
+
+def set_morl(enable: bool = True) -> None:
+    os.environ['MORL_ENV'] = str(enable).lower()
+
+
+def use_morl() -> bool:
+    return os.environ.get('MORL_ENV', 'false') == 'true'

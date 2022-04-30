@@ -7,6 +7,7 @@ from collections import deque
 import cv2
 import gym
 import numpy as np
+from tianshou.utils import use_morl
 
 try:
     import envpool
@@ -14,6 +15,8 @@ except ImportError:
     envpool = None
 
 from tianshou.env import ShmemVectorEnv
+
+from morl import environments as envs
 
 
 class NoopResetEnv(gym.Wrapper):
@@ -262,7 +265,27 @@ def make_atari_env(task, seed, training_num, test_num, **kwargs):
 
     :return: a tuple of (single env, training envs, test envs).
     """
-    if envpool is not None:
+    if use_morl():
+        env = envs.EnvPool.make_ale_env(
+            game="Pong",
+            n_envs=1,
+            base_seed=seed,
+        )
+        train_envs = envs.EnvPool.make_ale_env(
+            game="Pong",
+            n_envs=training_num,
+            base_seed=seed,
+            episodic_life=True,
+            reward_clip=True,
+        )
+        test_envs = envs.EnvPool.make_ale_env(
+            game="Pong",
+            n_envs=training_num,
+            base_seed=seed,
+            episodic_life=False,
+            reward_clip=False,
+        )
+    elif envpool is not None:
         if kwargs.get("scale", 0):
             warnings.warn(
                 "EnvPool does not include ScaledFloatFrame wrapper, "

@@ -17,6 +17,9 @@ from tianshou.data import (
 from tianshou.data.batch import _alloc_by_keys_diff
 from tianshou.env import BaseVectorEnv, DummyVectorEnv
 from tianshou.policy import BasePolicy
+from tianshou.utils import use_morl
+
+from morl import api
 
 
 class Collector(object):
@@ -60,6 +63,8 @@ class Collector(object):
         buffer: Optional[ReplayBuffer] = None,
         preprocess_fn: Optional[Callable[..., Batch]] = None,
         exploration_noise: bool = False,
+        is_test_collector: bool = False,
+        morl_memory: api.Memory = None,
     ) -> None:
         super().__init__()
         if isinstance(env, gym.Env) and not hasattr(env, "__len__"):
@@ -67,14 +72,22 @@ class Collector(object):
             self.env = DummyVectorEnv([lambda: env])  # type: ignore
         else:
             self.env = env  # type: ignore
-        self.env_num = len(self.env)
+        if use_morl():
+            self.env_num = env.n_envs
+        else:
+            self.env_num = len(self.env)
         self.exploration_noise = exploration_noise
         self._assign_buffer(buffer)
         self.policy = policy
         self.preprocess_fn = preprocess_fn
-        self._action_space = self.env.action_space
+        if use_morl():
+            self._action_space = self.env.env.action_space
+        else:
+            self._action_space = self.env.action_space
         # avoid creating attribute outside __init__
         self.reset(False)
+        self.is_test_collector = is_test_collector
+        self.morl_memory = morl_memory
 
     def _assign_buffer(self, buffer: Optional[ReplayBuffer]) -> None:
         """Check if the buffer matches the constraint."""
@@ -126,10 +139,15 @@ class Collector(object):
 
     def reset_env(self) -> None:
         """Reset all of the environments."""
-        obs = self.env.reset()
+        if use_morl():
+            self.env.reset_()
+            obs = self.env.get_states_()
+        else:
+            obs = self.env.reset()
         if self.preprocess_fn:
-            obs = self.preprocess_fn(obs=obs,
-                                     env_id=np.arange(self.env_num)).get("obs", obs)
+            obs = self.preprocess_fn(obs=obs, env_id=np.arange(self.env_num)).get(
+                "obs", obs
+            )
         self.data.obs = obs
 
     def _reset_state(self, id: Union[int, List[int]]) -> None:
@@ -183,7 +201,8 @@ class Collector(object):
             * ``rew_std`` standard error of episodic rewards.
             * ``len_std`` standard error of episodic lengths.
         """
-        assert not self.env.is_async, "Please use AsyncCollector if using async venv."
+        if not use_morl():
+            assert not self.env.is_async, "Please use AsyncCollector if using async venv."
         if n_step is not None:
             assert n_episode is None, (
                 f"Only one of n_step or n_episode is allowed in Collector."
@@ -199,7 +218,7 @@ class Collector(object):
         elif n_episode is not None:
             assert n_episode > 0
             ready_env_ids = np.arange(min(self.env_num, n_episode))
-            self.data = self.data[:min(self.env_num, n_episode)]
+            self.data = self.data[: min(self.env_num, n_episode)]
         else:
             raise TypeError(
                 "Please specify at least one (either n_step or n_episode) "
@@ -222,9 +241,7 @@ class Collector(object):
             # get the next action
             if random:
                 try:
-                    act_sample = [
-                        self._action_space[i].sample() for i in ready_env_ids
-                    ]
+                    act_sample = [self._action_space[i].sample() for i in ready_env_ids]
                 except TypeError:  # envpool's action space is not for per-env
                     act_sample = [self._action_space.sample() for _ in ready_env_ids]
                 act_sample = self.policy.map_action_inverse(act_sample)  # type: ignore
@@ -233,9 +250,15 @@ class Collector(object):
                 if no_grad:
                     with torch.no_grad():  # faster than retain_grad version
                         # self.data.obs will be used by agent to get result
-                        result = self.policy(self.data, last_state)
+                        if use_morl():
+                            result = self.policy(self.data.obs)
+                        else:
+                            result = self.policy(self.data, last_state)
                 else:
-                    result = self.policy(self.data, last_state)
+                    if use_morl():
+                        result = self.policy(self.data.obs)
+                    else:
+                        result = self.policy(self.data, last_state)
                 # update state / act / policy into self.data
                 policy = result.get("policy", Batch())
                 assert isinstance(policy, Batch)
@@ -250,8 +273,22 @@ class Collector(object):
             # get bounded and remapped actions first (not saved into buffer)
             action_remap = self.policy.map_action(self.data.act)
             # step in env
-            result = self.env.step(action_remap, ready_env_ids)  # type: ignore
-            obs_next, rew, done, info = result
+            if use_morl() and not n_episode:
+                exp_ = self.env.step_(action_remap[..., None])
+                obs_next, rew, done = (
+                    exp_.next_states,
+                    exp_.rewards.squeeze(),
+                    exp_.dones.squeeze(),
+                )
+                info = {}
+                if self.morl_memory is not None:
+                    self.morl_memory.add_(exp_)
+            elif isinstance(self.env, api.MorlEnv):
+                result = self.env.env.step(action_remap, ready_env_ids)  # type: ignore
+                obs_next, rew, done, info = result
+            else:
+                result = self.env.step(action_remap, ready_env_ids)  # type: ignore
+                obs_next, rew, done, info = result
 
             self.data.update(obs_next=obs_next, rew=rew, done=done, info=info)
             if self.preprocess_fn:
@@ -288,12 +325,22 @@ class Collector(object):
                 episode_start_indices.append(ep_idx[env_ind_local])
                 # now we copy obs_next to obs, but since there might be
                 # finished episodes, we have to reset finished envs first.
-                obs_reset = self.env.reset(env_ind_global)
-                if self.preprocess_fn:
-                    obs_reset = self.preprocess_fn(
-                        obs=obs_reset, env_id=env_ind_global
-                    ).get("obs", obs_reset)
-                self.data.obs_next[env_ind_local] = obs_reset
+                if use_morl() and not n_episode:
+                    self.data.obs_next = self.env.get_states_()
+                elif use_morl():
+                    obs_reset = self.env.env.reset(env_ind_global)
+                    if self.preprocess_fn:
+                        obs_reset = self.preprocess_fn(
+                            obs=obs_reset, env_id=env_ind_global
+                        ).get("obs", obs_reset)
+                    self.data.obs_next[env_ind_local] = obs_reset
+                else:
+                    obs_reset = self.env.reset(env_ind_global)
+                    if self.preprocess_fn:
+                        obs_reset = self.preprocess_fn(
+                            obs=obs_reset, env_id=env_ind_global
+                        ).get("obs", obs_reset)
+                    self.data.obs_next[env_ind_local] = obs_reset
                 for i in env_ind_local:
                     self._reset_state(i)
 
@@ -309,8 +356,9 @@ class Collector(object):
 
             self.data.obs = self.data.obs_next
 
-            if (n_step and step_count >= n_step) or \
-                    (n_episode and episode_count >= n_episode):
+            if (n_step and step_count >= n_step) or (
+                n_episode and episode_count >= n_episode
+            ):
                 break
 
         # generate statistics
@@ -326,10 +374,7 @@ class Collector(object):
 
         if episode_count > 0:
             rews, lens, idxs = list(
-                map(
-                    np.concatenate,
-                    [episode_rews, episode_lens, episode_start_indices]
-                )
+                map(np.concatenate, [episode_rews, episode_lens, episode_start_indices])
             )
             rew_mean, rew_std = rews.mean(), rews.std()
             len_mean, len_std = lens.mean(), lens.std()
@@ -448,9 +493,7 @@ class AsyncCollector(Collector):
             # get the next action
             if random:
                 try:
-                    act_sample = [
-                        self._action_space[i].sample() for i in ready_env_ids
-                    ]
+                    act_sample = [self._action_space[i].sample() for i in ready_env_ids]
                 except TypeError:  # envpool's action space is not for per-env
                     act_sample = [self._action_space.sample() for _ in ready_env_ids]
                 act_sample = self.policy.map_action_inverse(act_sample)  # type: ignore
@@ -548,8 +591,9 @@ class AsyncCollector(Collector):
                 whole_data[ready_env_ids] = self.data  # lots of overhead
             self.data = whole_data
 
-            if (n_step and step_count >= n_step) or \
-                    (n_episode and episode_count >= n_episode):
+            if (n_step and step_count >= n_step) or (
+                n_episode and episode_count >= n_episode
+            ):
                 break
 
         self._ready_env_ids = ready_env_ids
@@ -561,10 +605,7 @@ class AsyncCollector(Collector):
 
         if episode_count > 0:
             rews, lens, idxs = list(
-                map(
-                    np.concatenate,
-                    [episode_rews, episode_lens, episode_start_indices]
-                )
+                map(np.concatenate, [episode_rews, episode_lens, episode_start_indices])
             )
             rew_mean, rew_std = rews.mean(), rews.std()
             len_mean, len_std = lens.mean(), lens.std()

@@ -11,6 +11,8 @@ from tianshou.policy import BasePolicy
 from tianshou.trainer.utils import gather_info, test_episode
 from tianshou.utils import BaseLogger, LazyLogger, MovAvg, deprecation, tqdm_config
 
+from morl import api
+
 
 class BaseTrainer(ABC):
     """An iterator base class for trainers procedure.
@@ -145,6 +147,7 @@ class BaseTrainer(ABC):
         verbose: bool = True,
         test_in_train: bool = True,
         save_fn: Optional[Callable[[BasePolicy], None]] = None,
+        morl_memory: api.Memory[Any] = None,
     ):
         if save_fn:
             deprecation(
@@ -200,6 +203,7 @@ class BaseTrainer(ABC):
         self.best_epoch = self.start_epoch
         self.stop_fn_flag = False
         self.iter_num = 0
+        self.morl_memory = morl_memory
 
     def reset(self) -> None:
         """Initialize or reset the instance to yield a new iterator from zero."""

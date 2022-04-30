@@ -1,11 +1,12 @@
 from typing import Any, Callable, Dict, Optional, Union
+from attr import has
 
 import numpy as np
 
 from tianshou.data import Collector
 from tianshou.policy import BasePolicy
 from tianshou.trainer.base import BaseTrainer
-from tianshou.utils import BaseLogger, LazyLogger
+from tianshou.utils import BaseLogger, LazyLogger, use_morl
 
 
 class OffpolicyTrainer(BaseTrainer):
@@ -115,7 +116,10 @@ class OffpolicyTrainer(BaseTrainer):
         assert self.train_collector is not None
         for _ in range(round(self.update_per_step * result["n/st"])):
             self.gradient_step += 1
-            losses = self.policy.update(self.batch_size, self.train_collector.buffer)
+            if use_morl():
+                losses = self.policy.morl_update(self.morl_memory)
+            else:
+                losses = self.policy.update(self.batch_size, self.train_collector.buffer)
             self.log_update_data(data, losses)
 
 

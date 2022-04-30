@@ -8,6 +8,8 @@ import torch.nn.functional as F
 from tianshou.data import Batch, ReplayBuffer
 from tianshou.policy import DQNPolicy
 
+from morl import api
+
 
 class QRDQNPolicy(DQNPolicy):
     """Implementation of Quantile Regression Deep Q-Network. arXiv:1710.10044.
@@ -67,6 +69,17 @@ class QRDQNPolicy(DQNPolicy):
         next_dist = next_dist[np.arange(len(act)), act, :]
         return next_dist  # shape: [bsz, num_quantiles]
 
+    def _morl_target_q(self, batch: api.TensorExperience) -> torch.Tensor:
+        if self._target:
+            act = self(batch.next_states, input="obs_next").act
+            next_dist = self(batch.next_states, model="model_old", input="obs_next").logits
+        else:
+            next_batch = self(batch, input="obs_next")
+            act = next_batch.act
+            next_dist = next_batch.logits
+        next_dist = next_dist[np.arange(len(act)), act, :]
+        return next_dist  # shape: [bsz, num_quantiles]
+
     def compute_q_value(
         self, logits: torch.Tensor, mask: Optional[np.ndarray]
     ) -> torch.Tensor:
@@ -91,6 +104,34 @@ class QRDQNPolicy(DQNPolicy):
         # ref: https://github.com/ku2482/fqf-iqn-qrdqn.pytorch/
         # blob/master/fqf_iqn_qrdqn/agent/qrdqn_agent.py L130
         batch.weight = dist_diff.detach().abs().sum(-1).mean(1)  # prio-buffer
+        loss.backward()
+        self.optim.step()
+        self._iter += 1
+        return {"loss": loss.item()}
+
+    def morl_learn(self, batch: api.TensorExperience, target_returns: torch.Tensor) -> Dict[str, float]:
+        if self._target and self._iter % self._freq == 0:
+            self.sync_weight()
+        self.optim.zero_grad()
+        # weight = batch.pop("weight", 1.0)
+        weight = 1.0
+        if hasattr(batch, "weights"):
+            raise NotImplementedError()
+        curr_dist = self(batch.states).logits
+        act = batch.actions
+        curr_dist = curr_dist[np.arange(len(act)), act.long(), :].unsqueeze(2)
+        # target_dist = batch.returns.unsqueeze(1)
+        target_dist = target_returns.unsqueeze(1)
+        # calculate each element's difference between curr_dist and target_dist
+        dist_diff = F.smooth_l1_loss(target_dist, curr_dist, reduction="none")
+        huber_loss = (
+            dist_diff *
+            (self.tau_hat - (target_dist - curr_dist).detach().le(0.).float()).abs()
+        ).sum(-1).mean(1)
+        loss = (huber_loss * weight).mean()
+        # ref: https://github.com/ku2482/fqf-iqn-qrdqn.pytorch/
+        # blob/master/fqf_iqn_qrdqn/agent/qrdqn_agent.py L130
+        # batch.weight = dist_diff.detach().abs().sum(-1).mean(1)  # prio-buffer
         loss.backward()
         self.optim.step()
         self._iter += 1

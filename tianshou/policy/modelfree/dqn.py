@@ -1,11 +1,14 @@
 from copy import deepcopy
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Union, Tuple
 
 import numpy as np
 import torch
 
 from tianshou.data import Batch, ReplayBuffer, to_numpy, to_torch_as
 from tianshou.policy import BasePolicy
+from tianshou.utils import use_morl
+
+from morl import api
 
 
 class DQNPolicy(BasePolicy):
@@ -90,6 +93,17 @@ class DQNPolicy(BasePolicy):
         else:  # Nature DQN, over estimate
             return target_q.max(dim=1)[0]
 
+    def _morl_target_q(self, batch: api.TensorExperience) -> torch.Tensor:
+        online = self(batch.next_states)
+        if self._target:
+            target_q = self(batch.next_states, model="model_old").logits
+        else:
+            target_q = online.logits
+        if self._is_double:
+            return target_q[np.arange(len(online.act)), online.act]
+        else:
+            return target_q.max(dim=1)[0]
+
     def process_fn(
         self, batch: Batch, buffer: ReplayBuffer, indices: np.ndarray
     ) -> Batch:
@@ -103,6 +117,22 @@ class DQNPolicy(BasePolicy):
             self._rew_norm
         )
         return batch
+
+    def morl_process_fn(self, batch: api.Experience) -> Tuple[api.TensorExperience, torch.Tensor]:
+        """_summary_
+
+        :param batch: _description_
+        :type batch: api.Experience
+        :raises NotImplementedError: _description_
+        :return: experience and calculated next state return
+        :rtype: Tuple[api.Experience, torch.Tensor]
+        """
+        if hasattr(batch, "weights"):
+            # Prioritized Experience Replay is not supported yet
+            raise NotImplementedError()
+        return batch.as_default_tensor(), self.morl_compute_nstep_return(
+            batch, self._morl_target_q, self._gamma, self._n_step
+        )
 
     def compute_q_value(
         self, logits: torch.Tensor, mask: Optional[np.ndarray]
@@ -151,11 +181,22 @@ class DQNPolicy(BasePolicy):
             Please refer to :meth:`~tianshou.policy.BasePolicy.forward` for
             more detailed explanation.
         """
-        model = getattr(self, model)
-        obs = batch[input]
-        obs_next = obs.obs if hasattr(obs, "obs") else obs
-        logits, hidden = model(obs_next, state=state, info=batch.info)
-        q = self.compute_q_value(logits, getattr(obs, "mask", None))
+        if use_morl():
+            model = getattr(self, model)
+            # obs = batch.states
+            # obs_next = batch.next_states
+            # # logits are quantiles here
+            # logits, _ = model(obs_next) if input == "obs_next" else model(obs)
+            logits, _ = model(batch)
+            q = self.compute_q_value(logits, None)
+            hidden = None
+        else:
+            model = getattr(self, model)
+            obs = batch[input]
+            obs_next = obs.obs if hasattr(obs, "obs") else obs
+            logits, hidden = model(obs_next, state=state, info=batch.info)
+            q = self.compute_q_value(logits, getattr(obs, "mask", None))
+
         if not hasattr(self, "max_action_num"):
             self.max_action_num = q.shape[1]
         act = to_numpy(q.max(dim=1)[1])

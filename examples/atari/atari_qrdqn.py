@@ -12,7 +12,14 @@ from torch.utils.tensorboard import SummaryWriter
 from tianshou.data import Collector, VectorReplayBuffer
 from tianshou.policy import QRDQNPolicy
 from tianshou.trainer import offpolicy_trainer
-from tianshou.utils import TensorboardLogger, WandbLogger
+from tianshou.utils import TensorboardLogger, WandbLogger, set_morl, use_morl
+
+from morl import external_utils as extu
+from morl import memories
+from morl import core
+
+
+set_morl(True)
 
 
 def get_args():
@@ -70,14 +77,23 @@ def test_qrdqn(args=get_args()):
         scale=args.scale_obs,
         frame_stack=args.frames_stack,
     )
-    args.state_shape = env.observation_space.shape or env.observation_space.n
-    args.action_shape = env.action_space.shape or env.action_space.n
+    if use_morl():
+        env_spec = env.get_partial_spec()
+        args.state_shape = env_spec.state_space.shape
+        args.action_shape = env_spec.action_space.n
+    else:
+        args.state_shape = env.observation_space.shape or env.observation_space.n
+        args.action_shape = env.action_space.shape or env.action_space.n
     # should be N_FRAMES x H x W
     print("Observations shape:", args.state_shape)
     print("Actions shape:", args.action_shape)
-    # seed
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    if use_morl():
+        extu.manual_seed_morl(args.seed)
+        core.set_default_torch_device("cuda")
+    else:
+        # seed
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
     # define model
     net = QRDQN(*args.state_shape, args.action_shape, args.num_quantiles, args.device)
     optim = torch.optim.Adam(net.parameters(), lr=args.lr)
@@ -88,7 +104,7 @@ def test_qrdqn(args=get_args()):
         args.gamma,
         args.num_quantiles,
         args.n_step,
-        target_update_freq=args.target_update_freq
+        target_update_freq=args.target_update_freq,
     ).to(args.device)
     # load a previous policy
     if args.resume_path:
@@ -98,14 +114,21 @@ def test_qrdqn(args=get_args()):
     # when you have enough RAM
     buffer = VectorReplayBuffer(
         args.buffer_size,
-        buffer_num=len(train_envs),
+        buffer_num=train_envs.n_envs if use_morl() else len(train_envs),
         ignore_obs_next=True,
         save_only_last_obs=True,
         stack_num=args.frames_stack
     )
+    morl_memory = memories.NumbaNStepExperienceReplay.with_multi_threaded_atari_buffer(
+        batch_size=args.batch_size,
+        capacity_per_env=args.buffer_size,
+        n_steps=args.n_step,
+        n_envs=args.training_num,
+        frame_stack=4
+    )
     # collector
-    train_collector = Collector(policy, train_envs, buffer, exploration_noise=True)
-    test_collector = Collector(policy, test_envs, exploration_noise=True)
+    train_collector = Collector(policy, train_envs, buffer, exploration_noise=True, morl_memory=morl_memory)
+    test_collector = Collector(policy, test_envs, exploration_noise=True, is_test_collector=True)
 
     # log
     now = datetime.datetime.now().strftime("%y%m%d-%H%M%S")
@@ -133,6 +156,11 @@ def test_qrdqn(args=get_args()):
         torch.save(policy.state_dict(), os.path.join(log_path, "policy.pth"))
 
     def stop_fn(mean_rewards):
+        if use_morl():
+            if "Pong" in args.task:
+                return mean_rewards >= 20
+            else:
+                return mean_rewards >= env.get_partial_spec().reward_threshold
         if env.spec.reward_threshold:
             return mean_rewards >= env.spec.reward_threshold
         elif "Pong" in args.task:
@@ -159,7 +187,8 @@ def test_qrdqn(args=get_args()):
         print("Setup test envs ...")
         policy.eval()
         policy.set_eps(args.eps_test)
-        test_envs.seed(args.seed)
+        if not use_morl():
+            test_envs.seed(args.seed)
         if args.save_buffer_name:
             print(f"Generate buffer with size {args.buffer_size}")
             buffer = VectorReplayBuffer(
@@ -169,7 +198,7 @@ def test_qrdqn(args=get_args()):
                 save_only_last_obs=True,
                 stack_num=args.frames_stack
             )
-            collector = Collector(policy, test_envs, buffer, exploration_noise=True)
+            collector = Collector(policy, test_envs, buffer, exploration_noise=True, is_test_collector=True)
             result = collector.collect(n_step=args.buffer_size)
             print(f"Save buffer into {args.save_buffer_name}")
             # Unfortunately, pickle will cause oom with 1M buffer size
@@ -206,6 +235,7 @@ def test_qrdqn(args=get_args()):
         logger=logger,
         update_per_step=args.update_per_step,
         test_in_train=False,
+        morl_memory=morl_memory,
     )
 
     pprint.pprint(result)
